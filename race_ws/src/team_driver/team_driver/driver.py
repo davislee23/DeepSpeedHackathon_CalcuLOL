@@ -38,6 +38,7 @@ What you publish:
 """
 
 import math
+import os
 
 import numpy as np
 import rclpy
@@ -55,21 +56,40 @@ class Driver(Node):
 
         # Declared parameters can be retuned without editing code:
         #   ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
-        # Add your own as you go; config/driver_params.yaml loads them.
+        # Can add our own as we go; config/driver_params.yaml loads them.
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
         self.declare_parameter('crawl_speed', 1.0)        # [m/s]
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
+        self.declare_parameter('raceline_csv', '/hackathon/maps/icra26_centerline.csv')
+        self.declare_parameter('v_max', 4.0)              # [m/s] top speed on straights
+        self.declare_parameter('a_lat', 3.0)              # [m/s^2] sideways grip we trust in corners
+        self.declare_parameter('a_accel', 3.0)            # [m/s^2] how hard we speed up
+        self.declare_parameter('a_brake', 5.0)            # [m/s^2] how hard we slow down
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
         self.max_range = self.get_parameter('max_range').value
+        self.v_max = self.get_parameter('v_max').value
+        self.a_lat = self.get_parameter('a_lat').value
+        self.a_accel = self.get_parameter('a_accel').value
+        self.a_brake = self.get_parameter('a_brake').value
+        self.wheelbase = 0.33     # [m] distance between front and rear axle
 
-        # Latest known pose and speed. Ground truth from the simulator, which
-        # the rules allow you to use - so use it.
+        # Latest known pose and speed. Ground truth from the simulator, as guided by the repodity
         self.position = None      # (x, y) in the map frame
         self.yaw = 0.0            # [rad]
         self.speed = 0.0          # [m/s]
+
+        # Pure pursuit path: (x array, y array, speed array), filled by load_path()
+        self._path = None
+        self._ds = 0.1            # [m] spacing between path points after resampling
+        self._last_idx = None     # index of the path point nearest the car last time
+
+        # Logging state: which algorithm is active, scans spent in each, laps seen
+        self._mode = None
+        self._mode_scans = {'pure_pursuit': 0, 'follow_the_gap': 0}
+        self._laps = 0
 
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
@@ -80,14 +100,13 @@ class Driver(Node):
         self.create_subscription(
             Odometry, self.get_parameter('odom_topic').value, self.odom_callback, 10)
 
-        self._marker_divisor = 0
-        self.get_logger().warn(
-            'team_driver is up, but this template has no driving logic: it will '
-            'crawl straight ahead until it hits something. Implement plan().')
+        # Read the track centreline and build the speed profile once at start-up
+        self.load_path(self.get_parameter('raceline_csv').value)
 
-    # ------------------------------------------------------------------
-    # Odometry: where the car is. Free, accurate, and worth building on.
-    # ------------------------------------------------------------------
+        self._marker_divisor = 0
+
+    
+    # Odometry: scalable for custom nitpicking for best path/control
     def odom_callback(self, msg):
         self.position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
@@ -95,9 +114,7 @@ class Driver(Node):
                               1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self.speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
 
-    # ------------------------------------------------------------------
-    # The control loop, once per LiDAR scan (about 40 Hz).
-    # ------------------------------------------------------------------
+    # The main control loop, once per LiDAR scan (about 40 Hz).
     def scan_callback(self, scan):
         ranges, angles = self.preprocess(scan)
         steering, speed = self.plan(ranges, angles)
@@ -108,7 +125,7 @@ class Driver(Node):
             self.publish_marker(steering)
 
     def preprocess(self, scan):
-        """Turn a raw scan into clean ranges plus the angle of each beam.
+        """AI suggested: Turn a raw scan into clean ranges plus the angle of each beam.
 
         Kept because every approach needs some version of it and the details
         are fiddly rather than interesting: the LiDAR reports NaN and inf, and
@@ -121,11 +138,149 @@ class Driver(Node):
         angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
         return ranges, angles
 
-    # ==================================================================
-    # THIS IS THE PART YOU WRITE.
-    # ==================================================================
+    # Counts scans per algorithm and prints one line only when the active algorithm changes.
+    def log_mode(self, mode, reason):
+        self._mode_scans[mode] += 1
+        if mode != self._mode:
+            self._mode = mode
+            self.get_logger().info(
+                f'MODE -> {mode} ({reason}). Scans so far: '
+                f'pure_pursuit={self._mode_scans["pure_pursuit"]}, '
+                f'follow_the_gap={self._mode_scans["follow_the_gap"]}')
+
+    # Picks pure pursuit when the path and pose are ready, OTHERWSIE follow-the-gap.
     def plan(self, ranges, angles):
-    	# 1. Restrict view to forward field of view [-100 deg, +100 deg] (~ -1.75 to +1.75 rad)
+        # No path or no odometry yet, so use the LiDAR-only method
+        if self._path is None or self.position is None:
+            self.log_mode('follow_the_gap', 'waiting for path/odometry')
+            return self.follow_the_gap(ranges, angles)
+
+        return self.pure_pursuit(ranges, angles)
+
+    # Reads the centreline CSV, spaces it evenly and computes a target speed per point.
+    def load_path(self, csv_path):
+        if not os.path.exists(csv_path):
+            self.get_logger().error(f'Path file not found: {csv_path}. Using follow-the-gap.')
+            return
+
+        # Read the file, accepting either ',' or ';' as the separator
+        with open(csv_path, 'r') as f:
+            text = f.read().replace(';', ',')
+        rows = []
+        for line in text.splitlines():
+            parts = [p.strip() for p in line.split(',') if p.strip() != '']
+            try:
+                rows.append([float(p) for p in parts])
+            except ValueError:
+                continue  # skip header or comment lines
+        rows = [r for r in rows if len(r) >= 2]
+        if len(rows) < 10:
+            self.get_logger().error('Path file has too few numeric rows. Using follow-the-gap.')
+            return
+
+        # 7 columns means s;x;y;psi;kappa;vx;ax so x,y are columns 1,2; otherwise columns 0,1
+        width = min(len(r) for r in rows)
+        cols = (1, 2) if width >= 7 else (0, 1)
+        data = np.array([[r[cols[0]], r[cols[1]]] for r in rows])
+
+        # Make sure the path runs counter-clockwise (the racing direction)
+        x, y = data[:, 0], data[:, 1]
+        area = 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+        if area < 0:
+            data = data[::-1]
+
+        # Resample so points are evenly spaced (~0.1 m), which makes curvature reliable
+        closed = np.vstack([data, data[0]])
+        seg = np.hypot(np.diff(closed[:, 0]), np.diff(closed[:, 1]))
+        s = np.concatenate([[0.0], np.cumsum(seg)])
+        n = int(s[-1] / 0.1)
+        ds = s[-1] / n
+        s_new = np.arange(n) * ds
+        px = np.interp(s_new, s, closed[:, 0])
+        py = np.interp(s_new, s, closed[:, 1])
+
+        # Curvature = how fast the path's heading changes per metre (bigger = tighter)
+        heading = np.unwrap(np.arctan2(np.gradient(py), np.gradient(px)))
+        kappa = np.abs(np.gradient(heading, ds))
+        w = 9
+        padded = np.concatenate([kappa[-w:], kappa, kappa[:w]])
+        kappa = np.convolve(padded, np.ones(w) / w, mode='same')[w:-w]
+
+        # Corner speed limit from grip: v = sqrt(a_lat / curvature), capped at v_max
+        v = np.minimum(self.v_max, np.sqrt(self.a_lat / np.maximum(kappa, 1e-3)))
+
+        # Propagate braking backwards and acceleration forwards (twice round the loop)
+        for _ in range(2):
+            for i in range(n - 1, -1, -1):
+                v[i] = min(v[i], math.sqrt(v[(i + 1) % n] ** 2 + 2 * self.a_brake * ds))
+            for i in range(n):
+                v[i] = min(v[i], math.sqrt(v[i - 1] ** 2 + 2 * self.a_accel * ds))
+
+        self._path = (px, py, v)
+        self._ds = ds
+        self.get_logger().info(
+            f'Loaded {n} path points, {s[-1]:.1f} m lap, speeds {v.min():.1f}-{v.max():.1f} m/s.')
+
+    # Steers along an arc towards a path point a set distance ahead of the car.
+    def pure_pursuit(self, ranges, angles):
+        px, py, v = self._path
+        n = len(px)
+        x, y = self.position
+        dists = np.hypot(px - x, py - y)
+
+        # 1. Nearest path point: search everywhere at first, then only around the last one
+        prev_idx = self._last_idx
+        if self._last_idx is None:
+            nearest = int(np.argmin(dists))
+        else:
+            cand = (self._last_idx + np.arange(-10, 50)) % n
+            nearest = int(cand[np.argmin(dists[cand])])
+        self._last_idx = nearest
+
+        # Lap counter: the nearest index wrapping from the end of the path back to the start
+        if prev_idx is not None and prev_idx > 0.9 * n and nearest < 0.1 * n:
+            self._laps += 1
+            self.get_logger().info(
+                f'LAP {self._laps} of path completed. Scans so far: '
+                f'pure_pursuit={self._mode_scans["pure_pursuit"]}, '
+                f'follow_the_gap={self._mode_scans["follow_the_gap"]}')
+
+        # Far off the path (spun out or pushed away): recover with follow-the-gap
+        if dists[nearest] > 1.5:
+            self.log_mode('follow_the_gap', f'off path by {dists[nearest]:.1f} m')
+            self._last_idx = None
+            return self.follow_the_gap(ranges, angles)
+        self.log_mode('pure_pursuit', 'on path')
+
+        # 2. Lookahead grows with speed (faster = look further ahead)
+        lookahead = float(np.clip(0.8 + 0.3 * self.speed, 1.0, 3.0))
+        target_idx = (nearest + int(round(lookahead / self._ds))) % n
+
+        # 3. Convert the target from the map frame into the car's own frame
+        dx = px[target_idx] - x
+        dy = py[target_idx] - y
+        local_x = math.cos(self.yaw) * dx + math.sin(self.yaw) * dy
+        local_y = -math.sin(self.yaw) * dx + math.cos(self.yaw) * dy
+
+        # 4. Pure pursuit: curvature = 2*y / L^2, steering = atan(wheelbase * curvature)
+        dist_sq = max(local_x ** 2 + local_y ** 2, 0.01)
+        curvature = 2.0 * local_y / dist_sq
+        steering = float(np.clip(math.atan(self.wheelbase * curvature), -0.4, 0.4))
+
+        # 5. Speed comes straight from the precomputed profile
+        speed = float(v[nearest])
+
+        # Status line every 2 s: progress round the path, distance from it, steering, speeds
+        self.get_logger().info(
+            f'[PP] {100.0 * nearest / n:.0f}% round | off_path={dists[nearest]:.2f}m | '
+            f'steer={steering:.2f} | v_target={speed:.1f} v_actual={self.speed:.1f}',
+            throttle_duration_sec=2.0)
+
+        return steering, speed
+
+    # Your original follow-the-gap algorithm, unchanged (now the fallback).
+    def follow_the_gap(self, ranges, angles):
+        # 1. Restrict view to forward field of view [-100 deg, +100 deg] (~ -1.75 to +1.75 rad)
         fov_mask = (angles >= -1.75) & (angles <= 1.75)
         fov_ranges = ranges[fov_mask]
         fov_angles = angles[fov_mask]
@@ -140,7 +295,7 @@ class Driver(Node):
         # 3. Create a safety bubble around nearest obstacle (radius ~0.35m)
         car_radius = 0.35
         bubble_rad = math.atan2(car_radius, max(min_dist, 0.1))
-        
+
         proc_ranges = fov_ranges.copy()
         bubble_mask = np.abs(fov_angles - fov_angles[min_idx]) <= bubble_rad
         proc_ranges[bubble_mask] = 0.0
@@ -194,6 +349,7 @@ class Driver(Node):
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
+    # Sends the steering angle and speed to the simulator on /drive.
     def publish(self, steering, speed):
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -201,6 +357,7 @@ class Driver(Node):
         msg.drive.speed = float(speed)
         self.drive_pub.publish(msg)
 
+    # Draws an arrow in RViz showing where the car is steering.
     def publish_marker(self, target_angle):
         """Draw where the car thinks it is going. Add /driver/markers in RViz."""
         marker = Marker()
@@ -219,6 +376,7 @@ class Driver(Node):
         self.marker_pub.publish(array)
 
 
+# Starts ROS, runs the driver node until you press Ctrl+C, then shuts down cleanly.
 def main(args=None):
     rclpy.init(args=args)
     node = Driver()

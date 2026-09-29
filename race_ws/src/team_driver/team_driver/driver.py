@@ -57,6 +57,7 @@ class Driver(Node):
         # Declared parameters can be retuned without editing code:
         #   ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
         # Can add our own as we go; config/driver_params.yaml loads them.
+        # ADJUSTABLE-> EXPERIMENT WITH IT!!
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
@@ -67,6 +68,11 @@ class Driver(Node):
         self.declare_parameter('a_lat', 3.0)              # [m/s^2] sideways grip we trust in corners
         self.declare_parameter('a_accel', 3.0)            # [m/s^2] how hard we speed up
         self.declare_parameter('a_brake', 5.0)            # [m/s^2] how hard we slow down
+        self.declare_parameter('lookahead_base', 0.8)     # [m] lookahead at standstill
+        self.declare_parameter('lookahead_gain', 0.3)     # [s] extra lookahead per m/s of speed
+        self.declare_parameter('lookahead_min', 1.0)      # [m] lookahead never shorter than this
+        self.declare_parameter('lookahead_max', 3.0)      # [m] lookahead never longer than this
+        self.declare_parameter('max_steer', 0.4)          # [rad] steering clip; sim limit is 0.4189
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
         self.max_range = self.get_parameter('max_range').value
@@ -74,6 +80,11 @@ class Driver(Node):
         self.a_lat = self.get_parameter('a_lat').value
         self.a_accel = self.get_parameter('a_accel').value
         self.a_brake = self.get_parameter('a_brake').value
+        self.lookahead_base = self.get_parameter('lookahead_base').value
+        self.lookahead_gain = self.get_parameter('lookahead_gain').value
+        self.lookahead_min = self.get_parameter('lookahead_min').value
+        self.lookahead_max = self.get_parameter('lookahead_max').value
+        self.max_steer = self.get_parameter('max_steer').value
         self.wheelbase = 0.33     # [m] distance between front and rear axle
 
         # Latest known pose and speed. Ground truth from the simulator, as guided by the repodity
@@ -253,7 +264,10 @@ class Driver(Node):
         self.log_mode('pure_pursuit', 'on path')
 
         # 2. Lookahead grows with speed (faster = look further ahead)
-        lookahead = float(np.clip(0.8 + 0.3 * self.speed, 1.0, 3.0))
+        #ADJUSTABLE: CAN CHANGE GAIN
+        #Original: 0.8 + 0.3 * self.speed, 1.0, 3.0
+        lookahead = float(np.clip(self.lookahead_base + self.lookahead_gain * self.speed,
+                                  self.lookahead_min, self.lookahead_max))
         target_idx = (nearest + int(round(lookahead / self._ds))) % n
 
         # 3. Convert the target from the map frame into the car's own frame
@@ -265,7 +279,10 @@ class Driver(Node):
         # 4. Pure pursuit: curvature = 2*y / L^2, steering = atan(wheelbase * curvature)
         dist_sq = max(local_x ** 2 + local_y ** 2, 0.01)
         curvature = 2.0 * local_y / dist_sq
-        steering = float(np.clip(math.atan(self.wheelbase * curvature), -0.4, 0.4))
+
+        #ADJUSTABLE: CAN CHANGE 
+        steering = float(np.clip(math.atan(self.wheelbase * curvature),
+                                 -self.max_steer, self.max_steer))
 
         # 5. Speed comes straight from the precomputed profile
         speed = float(v[nearest])

@@ -65,7 +65,7 @@ class Driver(Node):
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
         self.declare_parameter('raceline_csv', '/hackathon/maps/icra26_centerline.csv')
         self.declare_parameter('v_max', 4.0)              # [m/s] top speed on straights
-        self.declare_parameter('a_lat', 3.0)              # [m/s^2] sideways grip we trust in corners
+        self.declare_parameter('a_lat', 5.0)              # [m/s^2] sideways grip we trust in corners (tuned: was 3.0)
         self.declare_parameter('a_accel', 3.0)            # [m/s^2] how hard we speed up
         self.declare_parameter('a_brake', 5.0)            # [m/s^2] how hard we slow down
         self.declare_parameter('lookahead_base', 0.8)     # [m] lookahead at standstill
@@ -102,6 +102,11 @@ class Driver(Node):
         self._mode_scans = {'pure_pursuit': 0, 'follow_the_gap': 0}
         self._laps = 0
 
+        # Lap timing on the simulator's clock (odom timestamps), so times match the referee's
+        self._sim_time = 0.0      # [s] stamp of the latest odometry message
+        self._lap_start = None    # [s] sim time the current lap started
+        self._best_lap = None     # [s] fastest full lap so far
+
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/driver/markers', 1)
@@ -124,6 +129,7 @@ class Driver(Node):
         self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                               1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self.speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
+        self._sim_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
     # The main control loop, once per LiDAR scan (about 40 Hz).
     def scan_callback(self, scan):
@@ -158,6 +164,25 @@ class Driver(Node):
                 f'MODE -> {mode} ({reason}). Scans so far: '
                 f'pure_pursuit={self._mode_scans["pure_pursuit"]}, '
                 f'follow_the_gap={self._mode_scans["follow_the_gap"]}')
+
+    # Prints the lap just finished with its sim-time duration and the best lap so far.
+    # The first lap starts from the grid, so it is partial and is not timed.
+    def log_lap(self):
+        now = self._sim_time
+        scans = (f'pure_pursuit={self._mode_scans["pure_pursuit"]}, '
+                 f'follow_the_gap={self._mode_scans["follow_the_gap"]}')
+        if self._lap_start is None:
+            self.get_logger().info(
+                f'LAP {self._laps} of path completed (partial, from the grid; not timed). '
+                f'Scans so far: {scans}')
+        else:
+            lap_time = now - self._lap_start
+            if self._best_lap is None or lap_time < self._best_lap:
+                self._best_lap = lap_time
+            self.get_logger().info(
+                f'LAP {self._laps} of path completed in {lap_time:.2f} s '
+                f'(best {self._best_lap:.2f} s). Scans so far: {scans}')
+        self._lap_start = now
 
     # Picks pure pursuit when the path and pose are ready, OTHERWSIE follow-the-gap.
     def plan(self, ranges, angles):
@@ -251,10 +276,7 @@ class Driver(Node):
         # Lap counter: the nearest index wrapping from the end of the path back to the start
         if prev_idx is not None and prev_idx > 0.9 * n and nearest < 0.1 * n:
             self._laps += 1
-            self.get_logger().info(
-                f'LAP {self._laps} of path completed. Scans so far: '
-                f'pure_pursuit={self._mode_scans["pure_pursuit"]}, '
-                f'follow_the_gap={self._mode_scans["follow_the_gap"]}')
+            self.log_lap()
 
         # Far off the path (spun out or pushed away): recover with follow-the-gap
         if dists[nearest] > 1.5:

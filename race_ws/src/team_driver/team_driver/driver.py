@@ -64,12 +64,13 @@ class Driver(Node):
         self.declare_parameter('crawl_speed', 1.0)        # [m/s]
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
         self.declare_parameter('raceline_csv', '/hackathon/maps/icra26_centerline.csv')
-        self.declare_parameter('v_max', 4.0)              # [m/s] top speed on straights
-        self.declare_parameter('a_lat', 5.0)              # [m/s^2] sideways grip we trust in corners (tuned: was 3.0)
-        self.declare_parameter('a_accel', 3.0)            # [m/s^2] how hard we speed up
-        self.declare_parameter('a_brake', 5.0)            # [m/s^2] how hard we slow down
+        # Tuned with results/tuning/tune.sh (0 collisions; ~17.8 s laps, was ~27.8 s)
+        self.declare_parameter('v_max', 6.5)              # [m/s] top speed on straights (was 4.0)
+        self.declare_parameter('a_lat', 9.5)              # [m/s^2] sideways grip we trust in corners (was 3.0)
+        self.declare_parameter('a_accel', 3.5)            # [m/s^2] how hard we speed up (was 3.0)
+        self.declare_parameter('a_brake', 6.0)            # [m/s^2] how hard we slow down (was 5.0)
         self.declare_parameter('lookahead_base', 0.8)     # [m] lookahead at standstill
-        self.declare_parameter('lookahead_gain', 0.3)     # [s] extra lookahead per m/s of speed
+        self.declare_parameter('lookahead_gain', 0.325)   # [s] extra lookahead per m/s of speed (was 0.3)
         self.declare_parameter('lookahead_min', 1.0)      # [m] lookahead never shorter than this
         self.declare_parameter('lookahead_max', 3.0)      # [m] lookahead never longer than this
         self.declare_parameter('max_steer', 0.4)          # [rad] steering clip; sim limit is 0.4189

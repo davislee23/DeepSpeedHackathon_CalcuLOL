@@ -34,9 +34,6 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 class TrackProcessor:
-    """Handles offline path loading, closed-loop smoothing, curvature calculation,
-    and forward/backward speed profile generation.
-    """
     def __init__(self, csv_path: str, max_speed: float, max_lat_accel: float, 
                  max_accel: float, max_decel: float):
         self.csv_path = csv_path
@@ -48,6 +45,7 @@ class TrackProcessor:
         self.x = np.array([])
         self.y = np.array([])
         self.s = np.array([])
+        self.total_s = 0.0
         self.kappa = np.array([])
         self.v_target = np.array([])
         self.N = 0
@@ -58,7 +56,7 @@ class TrackProcessor:
         if not os.path.exists(self.csv_path):
             raise FileNotFoundError(f"Raceline CSV not found at: {self.csv_path}")
 
-        raw_x, raw_y = [], []
+        raw_x, raw_y, raw_vx = [], [], []
         with open(self.csv_path, 'r') as f:
             for line in f:
                 line = line.strip()
@@ -68,13 +66,14 @@ class TrackProcessor:
                 delimiter = ';' if ';' in line else ','
                 parts = [p.strip() for p in line.split(delimiter)]
                 
-                if len(parts) >= 6:  # Full raceline format (s; x; y; psi; kappa; vx; ax)
+                if len(parts) >= 6:
                     try:
                         raw_x.append(float(parts[1]))
                         raw_y.append(float(parts[2]))
+                        raw_vx.append(float(parts[5]))
                     except ValueError:
                         continue
-                elif len(parts) >= 2:  # Simple centerline format (x, y)
+                elif len(parts) >= 2:
                     try:
                         raw_x.append(float(parts[0]))
                         raw_y.append(float(parts[1]))
@@ -87,12 +86,12 @@ class TrackProcessor:
         x = np.array(raw_x, dtype=np.float64)
         y = np.array(raw_y, dtype=np.float64)
 
-        # 1. Close loop explicitly if endpoints differ
         if np.hypot(x[0] - x[-1], y[0] - y[-1]) > 0.1:
             x = np.append(x, x[0])
             y = np.append(y, y[0])
+            if len(raw_vx) > 0:
+                raw_vx.append(raw_vx[0])
 
-        # 2. Closed-loop path smoothing
         pad_len = 15
         x_padded = np.pad(x, pad_len, mode='wrap')
         y_padded = np.pad(y, pad_len, mode='wrap')
@@ -105,14 +104,15 @@ class TrackProcessor:
         self.x = x_smooth
         self.y = y_smooth
 
-        # 3. Calculate arc length (s)
         dx = np.diff(self.x, prepend=self.x[-1])
         dy = np.diff(self.y, prepend=self.y[-1])
         ds = np.hypot(dx, dy)
         ds[ds < 1e-6] = 1e-6
-        self.s = np.cumsum(ds)
 
-        # 4. Smooth gradient-based curvature calculation
+        self.s = np.zeros(self.N, dtype=np.float64)
+        self.s[1:] = np.cumsum(ds[1:])
+        self.total_s = float(np.sum(ds))
+
         dx_ds = np.gradient(self.x, self.s)
         dy_ds = np.gradient(self.y, self.s)
         ddx_ds = np.gradient(dx_ds, self.s)
@@ -124,25 +124,28 @@ class TrackProcessor:
         
         self.kappa = gaussian_filter1d(np.pad(num / den, pad_len, mode='wrap'), sigma=1.5)[pad_len:-pad_len]
 
-        # 5. Speed profile generation with realistic lateral friction limits
-        v_lat = np.sqrt(self.max_lat_accel / (np.abs(self.kappa) + 1e-3))
+        v_lat = np.sqrt(self.max_lat_accel / (np.abs(self.kappa) + 1e-4))
         v_profile = np.minimum(self.max_speed, v_lat)
 
         v_ext = np.tile(v_profile, 2)
         ds_ext = np.tile(ds, 2)
         N_ext = len(v_ext)
 
-        # Backward pass (Braking limit)
         for i in range(N_ext - 2, -1, -1):
             v_max_brake = np.sqrt(v_ext[i + 1] ** 2 + 2.0 * self.max_decel * ds_ext[i + 1])
             v_ext[i] = min(v_ext[i], v_max_brake)
 
-        # Forward pass (Acceleration limit)
         for i in range(1, N_ext):
             v_max_accel = np.sqrt(v_ext[i - 1] ** 2 + 2.0 * self.max_accel * ds_ext[i])
             v_ext[i] = min(v_ext[i], v_max_accel)
 
-        self.v_target = np.clip(v_ext[self.N:2 * self.N], 1.5, self.max_speed)
+        calc_v = np.clip(v_ext[self.N:2 * self.N], 3.0, self.max_speed)
+
+        if len(raw_vx) == len(x) and len(raw_vx) > 0:
+            raw_v_arr = np.clip(np.array(raw_vx, dtype=np.float64), 3.0, self.max_speed)
+            self.v_target = np.maximum(raw_v_arr, calc_v)
+        else:
+            self.v_target = calc_v
 
 
 class Driver(Node):
@@ -153,63 +156,66 @@ class Driver(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('csv_path', '/hackathon/race_ws/src/team_driver/team_driver/maps/icra26_raceline.csv')
-        self.declare_parameter('crawl_speed', 1.5)
+        self.declare_parameter('raceline_csv', '/hackathon/race_ws/src/team_driver/team_driver/maps/icra26_raceline.csv')
+        self.declare_parameter('csv_path', '')
+        self.declare_parameter('crawl_speed', 2.0)
         self.declare_parameter('max_range', 8.0)
         self.declare_parameter('wheelbase', 0.33)
         self.declare_parameter('max_steering_angle', 0.4189)
-        self.declare_parameter('max_speed', 6.5)
-        self.declare_parameter('max_lat_accel', 3.8)      # Reduced from 5.5 to prevent understeer wall strikes
-        self.declare_parameter('max_accel', 3.0)          
-        self.declare_parameter('max_decel', 4.5)          
-        self.declare_parameter('min_lookahead', 0.8)      # Reduced min lookahead to prevent corner-cutting
-        self.declare_parameter('max_lookahead', 2.2)      
-        self.declare_parameter('lookahead_gain', 0.20)    
+        
+        self.declare_parameter('max_speed', 15.0)
+        self.declare_parameter('max_lat_accel', 11.5)
+        self.declare_parameter('max_accel', 12.0)
+        self.declare_parameter('max_decel', 12.0)
+        
+        self.declare_parameter('min_lookahead', 1.10)
+        self.declare_parameter('max_lookahead', 4.50)
+        self.declare_parameter('lookahead_gain', 0.25)
+        
         self.declare_parameter('search_window', 80)
-        self.declare_parameter('obstacle_corridor_width', 0.50)
+        self.declare_parameter('obstacle_corridor_width', 0.38)
         self.declare_parameter('debounce_threshold', 3)
 
-        # Retrieve parameters
-        self.crawl_speed = self.get_parameter('crawl_speed').value
-        self.max_range = self.get_parameter('max_range').value
-        self.wb = self.get_parameter('wheelbase').value
-        self.max_steer = self.get_parameter('max_steering_angle').value
-        self.max_speed = self.get_parameter('max_speed').value
-        self.min_lh = self.get_parameter('min_lookahead').value
-        self.max_lh = self.get_parameter('max_lookahead').value
-        self.lh_gain = self.get_parameter('lookahead_gain').value
-        self.search_window = self.get_parameter('search_window').value
-        self.corridor_w = self.get_parameter('obstacle_corridor_width').value
-        self.debounce_thresh = self.get_parameter('debounce_threshold').value
+        self.crawl_speed = float(self.get_parameter('crawl_speed').value)
+        self.max_range = float(self.get_parameter('max_range').value)
+        self.wb = float(self.get_parameter('wheelbase').value)
+        self.max_steer = float(self.get_parameter('max_steering_angle').value)
+        self.max_speed = float(self.get_parameter('max_speed').value)
+        self.min_lh = float(self.get_parameter('min_lookahead').value)
+        self.max_lh = float(self.get_parameter('max_lookahead').value)
+        self.lh_gain = float(self.get_parameter('lookahead_gain').value)
+        self.search_window = int(self.get_parameter('search_window').value)
+        self.corridor_w = float(self.get_parameter('obstacle_corridor_width').value)
+        self.debounce_thresh = int(self.get_parameter('debounce_threshold').value)
 
-        # Real-time State Variables
         self.position = None
         self.yaw = 0.0
         self.speed = 0.0
         self.prev_nearest_idx = 0
         self.prev_steering = 0.0
+        self.cached_angles = None
         
-        # Debounce State Machine Variables
         self.blocked_counter = 0
         self.clear_counter = 0
         self.state_avoidance = False
 
-        # Load Track Processing Data
-        csv_path = self.get_parameter('csv_path').value
+        csv_path = self.get_parameter('raceline_csv').value
+        if not csv_path or not os.path.exists(csv_path):
+            csv_path = self.get_parameter('csv_path').value
+
         try:
             self.track = TrackProcessor(
                 csv_path=csv_path,
                 max_speed=self.max_speed,
-                max_lat_accel=self.get_parameter('max_lat_accel').value,
-                max_accel=self.get_parameter('max_accel').value,
-                max_decel=self.get_parameter('max_decel').value
+                max_lat_accel=float(self.get_parameter('max_lat_accel').value),
+                max_accel=float(self.get_parameter('max_accel').value),
+                max_decel=float(self.get_parameter('max_decel').value)
             )
             self.get_logger().info(f"Loaded track raceline with {self.track.N} points")
         except Exception as e:
             self.get_logger().error(f"Failed to load track processor: {e}")
             self.track = None
 
-        # Publishers & Subscribers
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/driver/markers', 1)
@@ -242,55 +248,46 @@ class Driver(Node):
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=self.max_range, neginf=0.0)
         ranges = np.clip(ranges, 0.0, self.max_range)
 
-        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
-        return ranges, angles
+        if self.cached_angles is None or len(self.cached_angles) != len(ranges):
+            self.cached_angles = scan.angle_min + np.arange(len(ranges), dtype=np.float64) * scan.angle_increment
+
+        return ranges, self.cached_angles
 
     def _find_nearest_index(self, car_x: float, car_y: float) -> int:
         N = self.track.N
-        indices = [(self.prev_nearest_idx + i) % N for i in range(-self.search_window, self.search_window)]
+        half_w = self.search_window
+        indices = np.arange(self.prev_nearest_idx - half_w, self.prev_nearest_idx + half_w) % N
         
         pts_x = self.track.x[indices]
         pts_y = self.track.y[indices]
         
-        dists = (pts_x - car_x) ** 2 + (pts_y - car_y) ** 2
-        min_local_idx = np.argmin(dists)
+        dx = pts_x - car_x
+        dy = pts_y - car_y
+        dists_sq = dx * dx + dy * dy
+        min_local_idx = np.argmin(dists_sq)
         
-        if dists[min_local_idx] > 4.0:
-            all_dists = (self.track.x - car_x) ** 2 + (self.track.y - car_y) ** 2
-            nearest_idx = int(np.argmin(all_dists))
+        if dists_sq[min_local_idx] > 4.0:
+            dx_all = self.track.x - car_x
+            dy_all = self.track.y - car_y
+            nearest_idx = int(np.argmin(dx_all * dx_all + dy_all * dy_all))
         else:
-            nearest_idx = indices[min_local_idx]
+            nearest_idx = int(indices[min_local_idx])
 
         self.prev_nearest_idx = nearest_idx
         return nearest_idx
 
     def _find_target_point_arclength(self, car_x: float, car_y: float, car_yaw: float, lookahead_dist: float) -> tuple[float, float, int]:
-        """Find lookahead point along raceline path arc-length (prevents jumping across track walls)."""
-        N = self.track.N
         nearest_idx = self._find_nearest_index(car_x, car_y)
 
-        accum_dist = 0.0
-        for i in range(1, N):
-            idx = (nearest_idx + i) % N
-            prev_idx = (nearest_idx + i - 1) % N
+        s_target = (self.track.s[nearest_idx] + lookahead_dist) % self.track.total_s
+        target_idx = int(np.searchsorted(self.track.s, s_target))
+        if target_idx >= self.track.N:
+            target_idx = self.track.N - 1
 
-            dx = self.track.x[idx] - self.track.x[prev_idx]
-            dy = self.track.y[idx] - self.track.y[prev_idx]
-            accum_dist += math.hypot(dx, dy)
-
-            if accum_dist >= lookahead_dist:
-                tx, ty = self.track.x[idx], self.track.y[idx]
-                dx_c = tx - car_x
-                dy_c = ty - car_y
-                x_c = dx_c * math.cos(car_yaw) + dy_c * math.sin(car_yaw)
-                if x_c > 0.0:
-                    return tx, ty, idx
-
-        return self.track.x[nearest_idx], self.track.y[nearest_idx], nearest_idx
+        return float(self.track.x[target_idx]), float(self.track.y[target_idx]), target_idx
 
     def _check_obstacle(self, ranges: np.ndarray, angles: np.ndarray) -> bool:
-        """Check dynamic forward corridor scaled with current speed."""
-        forward_look = max(1.2, 0.4 * self.speed + 0.6)
+        forward_look = max(0.8, min(1.8, 0.25 * self.speed + 0.3))
         valid = (ranges > 0.1) & (ranges < forward_look)
         r = ranges[valid]
         a = angles[valid]
@@ -298,8 +295,8 @@ class Driver(Node):
         x_c = r * np.cos(a)
         y_c = r * np.sin(a)
 
-        in_corridor = (x_c > 0.15) & (x_c < forward_look) & (np.abs(y_c) < self.corridor_w / 2.0)
-        return bool(np.any(in_corridor))
+        in_corridor = (x_c > 0.20) & (x_c < forward_look) & (np.abs(y_c) < self.corridor_w / 2.0) & (np.abs(a) < 0.35)
+        return bool(np.sum(in_corridor) >= 6)
 
     def _plan_fallback_ftg(self, ranges: np.ndarray, angles: np.ndarray) -> tuple[float, float]:
         fov_mask = (angles >= -1.2) & (angles <= 1.2)
@@ -312,7 +309,7 @@ class Driver(Node):
         min_idx = np.argmin(fov_ranges)
         min_dist = fov_ranges[min_idx]
 
-        car_radius = 0.40
+        car_radius = 0.22
         bubble_rad = math.atan2(car_radius, max(min_dist, 0.1))
         
         proc_ranges = fov_ranges.copy()
@@ -323,7 +320,8 @@ class Driver(Node):
         free_space = proc_ranges > gap_threshold
 
         if not np.any(free_space):
-            best_idx = np.argmax(proc_ranges)
+            proc_smooth = gaussian_filter1d(proc_ranges, sigma=2.0)
+            best_idx = np.argmax(proc_smooth)
             target_angle = fov_angles[best_idx]
         else:
             bounded = np.pad(free_space.astype(int), (1, 1), 'constant')
@@ -341,42 +339,33 @@ class Driver(Node):
             target_angle = (gap_angles[0] + gap_angles[-1]) / 2.0
 
         steering = float(np.clip(0.85 * target_angle, -self.max_steer, self.max_steer))
-        speed = 2.0
+        speed = float(np.clip(3.0 * (min_dist / 1.2), 1.5, 4.0))
         return steering, speed
 
     def _apply_wall_safety_guard(self, ranges: np.ndarray, angles: np.ndarray, 
                                  raw_speed: float, raw_steering: float) -> tuple[float, float]:
-        """Scans front/side LIDAR to actively prevent collisions into nearby walls."""
-        # Front wall emergency check
-        front_mask = (angles >= -0.6) & (angles <= 0.6) & (ranges > 0.05)
+        front_mask = (angles >= -0.25) & (angles <= 0.25) & (ranges > 0.05)
         if np.any(front_mask):
             front_min = np.min(ranges[front_mask])
-            safe_dist = 0.4 + 0.15 * self.speed
+            safe_dist = 0.60 + 0.15 * self.speed
             if front_min < safe_dist:
-                speed_scale = max(0.2, front_min / safe_dist)
+                speed_scale = max(0.1, front_min / safe_dist)
                 raw_speed *= speed_scale
 
-        # Left / Right Wall Repulsion
-        left_mask = (angles > 0.35) & (angles < 1.4) & (ranges > 0.05)
-        right_mask = (angles < -0.35) & (angles > -1.4) & (ranges > 0.05)
+        left_mask = (angles > 0.30) & (angles < 1.4) & (ranges > 0.05)
+        right_mask = (angles < -0.30) & (angles > -1.4) & (ranges > 0.05)
 
         min_left = np.min(ranges[left_mask]) if np.any(left_mask) else 2.0
         min_right = np.min(ranges[right_mask]) if np.any(right_mask) else 2.0
 
-        wall_margin = 0.38  # Minimum desired clearance (meters)
-        
-        if min_left < wall_margin:
-            nudge = -0.12 * (wall_margin - min_left) / wall_margin
-            raw_steering += nudge
-        elif min_right < wall_margin:
-            nudge = 0.12 * (wall_margin - min_right) / wall_margin
-            raw_steering += nudge
+        wall_margin = 0.45
+        left_repulsion = max(0.0, (wall_margin - min_left) / wall_margin)
+        right_repulsion = max(0.0, (wall_margin - min_right) / wall_margin)
 
-        # High steering angle speed reduction (prevents high-speed friction loss / understeer)
-        steer_factor = 1.0 - 0.45 * (abs(raw_steering) / self.max_steer)
-        adjusted_speed = raw_speed * steer_factor
+        net_nudge = 0.35 * (right_repulsion - left_repulsion)
+        raw_steering += net_nudge
 
-        return float(np.clip(raw_steering, -self.max_steer, self.max_steer)), float(max(1.2, adjusted_speed))
+        return float(np.clip(raw_steering, -self.max_steer, self.max_steer)), float(max(0.5, raw_speed))
 
     def plan(self, ranges, angles):
         if self.position is None or self.track is None:
@@ -385,16 +374,14 @@ class Driver(Node):
         car_x, car_y = self.position
         car_yaw = self.yaw
 
-        # 1. Dynamic Lookahead scaled by speed & track curvature
         nearest_idx = self._find_nearest_index(car_x, car_y)
         curr_kappa = abs(self.track.kappa[nearest_idx])
         
-        # Scale lookahead shorter in tight turns (high kappa) to prevent cutting corners into inner walls
-        curv_scale = 1.0 / (1.0 + 3.0 * curr_kappa)
+        curv_scale = 1.0 / (1.0 + 0.6 * curr_kappa) 
         base_lh = self.min_lh + self.lh_gain * self.speed
-        lookahead_dist = float(np.clip(base_lh * curv_scale, self.min_lh, self.max_lh))
+        
+        lookahead_dist = float(np.clip(base_lh * curv_scale, 0.9, self.max_lh))
 
-        # 2. Debounced obstacle detection
         is_blocked = self._check_obstacle(ranges, angles)
         if is_blocked:
             self.blocked_counter += 1
@@ -408,22 +395,18 @@ class Driver(Node):
         elif self.clear_counter >= self.debounce_thresh:
             self.state_avoidance = False
 
-        # 3. Path Tracking vs Obstacle Avoidance Mode
         if self.state_avoidance:
             raw_steer, raw_speed = self._plan_fallback_ftg(ranges, angles)
-            steering = 0.3 * self.prev_steering + 0.7 * raw_steer
+            steering = 0.20 * self.prev_steering + 0.80 * raw_steer
             self.prev_steering = steering
             return steering, raw_speed
 
-        # 4. Pure Pursuit Target Search via Path Arc Length
         gx, gy, target_idx = self._find_target_point_arclength(car_x, car_y, car_yaw, lookahead_dist)
 
-        # Map target point into vehicle frame (x-forward, y-left)
         dx, dy = gx - car_x, gy - car_y
         x_c = dx * math.cos(car_yaw) + dy * math.sin(car_yaw)
         y_c = -dx * math.sin(car_yaw) + dy * math.cos(car_yaw)
 
-        # Pure Pursuit geometry calculation
         L_sq = x_c**2 + y_c**2
         if L_sq < 1e-4:
             L_sq = 1e-4
@@ -431,14 +414,11 @@ class Driver(Node):
         gamma = (2.0 * y_c) / L_sq
         raw_steering = math.atan(gamma * self.wb)
 
-        # Target Speed from raceline profile
-        target_speed = float(self.track.v_target[target_idx])
+        target_speed = float(min(self.track.v_target[nearest_idx], self.track.v_target[target_idx]))
 
-        # 5. Apply Active LIDAR Wall Safety Guard
         safe_steering, safe_speed = self._apply_wall_safety_guard(ranges, angles, target_speed, raw_steering)
 
-        # 6. Fast-response Low-Pass Filter (0.15 prev / 0.85 new) to prevent steering phase lag
-        steering = 0.15 * self.prev_steering + 0.85 * safe_steering
+        steering = 0.18 * self.prev_steering + 0.82 * safe_steering
         self.prev_steering = steering
 
         return steering, safe_speed

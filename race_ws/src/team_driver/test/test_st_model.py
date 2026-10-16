@@ -91,11 +91,6 @@ class StructureTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'model'):
             VehicleModel(model_type='MB')
 
-    def test_state_bounds_cover_every_actuated_state(self):
-        lo, hi = VehicleModel(model_type='ST').get_state_bounds()
-        self.assertGreaterEqual(len(lo), 7)
-        self.assertGreaterEqual(len(hi), 7)
-
 
 class ContinuousDynamicsTest(unittest.TestCase):
     """Our right-hand side is the gym's, moved from the CoG to the rear axle."""

@@ -32,17 +32,18 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import plant_sim  # noqa: E402
+from driver_params import DEFAULTS  # noqa: E402
 from lap_sim import cadence_steps  # noqa: E402
-from vehicle_model import VehicleModel  # noqa: E402
+from vehicle_model import PLANT_STEP_DT, VehicleModel  # noqa: E402
 
 SPEEDS = (3.0, 5.0, 7.0)          # [m/s]
 SECONDS = 4.0                     # [s] of plant time per speed
-CONTROL_PERIOD = 0.025            # [s] the node's timer
+CONTROL_PERIOD = DEFAULTS['control_period']   # [s] the node's timer
 # The controller's horizon: the long schedule and the judged block map.
-SCHEDULE = (0.025, 0.025, 0.05, 0.05, 0.075, 0.075, 0.1, 0.1)   # [s], 0.5 s
-BLOCK_MAP = (0, 1, 1, 2, 2, 2, 2, 2)
+SCHEDULE = tuple(DEFAULTS['mpc.dt_schedule'])   # [s], 0.5 s
+BLOCK_MAP = tuple(DEFAULTS['mpc.block_map'])
 HORIZON_STRIDE = 4                # start a horizon every this many ticks
-PHYSICS_DT = 0.01                 # [s] the judged plant's step
+PHYSICS_DT = PLANT_STEP_DT       # [s] the judged plant's step
 # A sweep that reaches ~8-10 m/s^2 of lateral acceleration at 7 m/s: the slip
 # regime the ST model exists for.
 STEER_AMPLITUDE = 0.10            # [rad]

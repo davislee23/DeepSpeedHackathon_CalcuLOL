@@ -10,17 +10,8 @@ import math
 from typing import Tuple, Optional, Sequence
 from scipy.optimize import minimize
 import time
-import os
-import sys
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-try:
-    from .vehicle_model import ST_SWITCH_SPEED, SpeedLoop, VehicleModel   # ROS / package import
-    from . import speed_profile as _speed_profile
-except ImportError:
-    from vehicle_model import ST_SWITCH_SPEED, SpeedLoop, VehicleModel    # standalone `python3 mpc_controller.py`
-    import speed_profile as _speed_profile
+from vehicle_model import ST_SWITCH_SPEED, SpeedLoop, VehicleModel
+import speed_profile as _speed_profile
 
 # scipy's SLSQP status for "iteration limit reached". The iterate is still a
 # feasible improvement on the warm start, so a capped solve is applied, not
@@ -125,11 +116,7 @@ class MPCController:
         # Cost function weights. Neither beta, the wheel angle nor the yaw rate
         # is tracked: the wheel is where it is, and the command is costed
         # through R.
-        self.Q = np.diag([q_pos, q_pos, q_yaw, q_vel] + untracked)
-        self.R = np.diag([r_steer, r_accel])           # [steering, acceleration]
-        self.R_delta = np.diag([r_delta_steer, r_delta_accel])  # Control change weights
-
-        # Diagonal forms, for the vectorized cost. q_yaw is handled separately
+        # Diagonal weights, for the vectorized cost. q_yaw is handled separately
         # (angle wrapping) so it is zeroed here and re-added wrapped.
         self.Q_diag_masked = np.array([q_pos, q_pos, 0.0, q_vel] + untracked)
         self.q_yaw_wrap = q_yaw
@@ -146,12 +133,6 @@ class MPCController:
         self._block_list = self.block_map.tolist()
         self._dts_list = [float(h) for h in self.dt_schedule]
         self._base = None   # (u, states, cumulative stage cost) of the last _objective
-
-        # Get bounds from vehicle model
-        _, self.state_max = self.vehicle_model.get_state_bounds()
-        self.state_min, _ = self.vehicle_model.get_state_bounds()
-        self.state_min = self.state_min[:self.state_dim]
-        self.state_max = self.state_max[:self.state_dim]
 
         self.control_min, self.control_max = self.vehicle_model.get_control_bounds()
 
@@ -171,7 +152,6 @@ class MPCController:
         self._speed_loop = SpeedLoop.of(self.vehicle_model.params)
         self._mean_waypoint_spacing = 0.2  # overwritten by set_reference_path
         self._last_path_index = None
-        self._last_heading = 0.0
 
         # Continuous arc position of the reference, in [0, _path_len). The
         # path array holds exactly one lap, so a *continuously increasing* arc
@@ -298,7 +278,6 @@ class MPCController:
             seg = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)
             self._mean_waypoint_spacing = float(np.mean(seg)) or 0.2
             self._path_arc = np.concatenate([[0.0], np.cumsum(seg)])
-            self._kappa_smooth = self._curvature(path[:, :2])
             # The CSV omits the closing segment back to waypoint 0, so the
             # drivable lap is arc[n-1] + that last gap, not arc[n-1].
             self._path_len = float(self._path_arc[-1]
@@ -311,7 +290,6 @@ class MPCController:
         else:
             self._mean_waypoint_spacing = 0.2
             self._path_arc = None
-            self._kappa_smooth = None
             self._path_len = 0.0
             self._ff_arc = None
             self._ff_kappa = None
@@ -320,65 +298,6 @@ class MPCController:
         # A new path invalidates the local search window.
         self._last_path_index = None
         self._s_ref = None
-        self._last_heading = 0.0
-
-    @staticmethod
-    def _curvature(p: np.ndarray, smooth: int = 9) -> np.ndarray:
-        """Smoothed path curvature from three-point circumscribed circles.
-
-        k = 4*Area / (|ab| |bc| |ac|). At 0.2 m spacing the raw estimate is
-        noisy enough to make the speed profile jitter, so smooth it with a
-        centred moving average.
-        """
-        n = len(p)
-        if n < 3:
-            return np.zeros(n)
-        a, b, c = p[:-2], p[1:-1], p[2:]
-        ab, bc, ac = b - a, c - b, c - a
-        cross = np.abs(ab[:, 0] * bc[:, 1] - ab[:, 1] * bc[:, 0])
-        denom = (np.linalg.norm(ab, axis=1)
-                 * np.linalg.norm(bc, axis=1)
-                 * np.linalg.norm(ac, axis=1))
-        kappa = np.zeros(n)
-        kappa[1:-1] = np.where(denom > 1e-9, 2.0 * cross / np.maximum(denom, 1e-9), 0.0)
-        kern = np.ones(smooth) / smooth
-        return np.convolve(kappa, kern, mode='same')
-
-    def speed_profile(self, path: np.ndarray = None, *, v_max: float = 3.0,
-                      a_lat_max: float = 0.8, lock_margin: float = 0.95,
-                      a_accel_max: float = 9.51, a_brake_max: float = 0.8,
-                      closed: bool = True,
-                      sector_scale: Sequence[Sequence[float]] = (),
-                      gg_brake: bool = False,
-                      gg_floor: float = _speed_profile.GG_FLOOR) -> np.ndarray:
-        """Closed-loop speed profile for the lap; see `speed_profile.py`.
-
-        The reference used to demand an instant jump to corner speed, so the car
-        braked late and ran wide into the wall. The profile is now braked for
-        round the finish line, limited by what the plant can accelerate, and
-        capped by the slip budget `a_lat_max` and the steering lock. It uses its
-        own wrapped curvature, not `_kappa_smooth`.
-
-        Args:
-            path: Path to profile; defaults to the configured one. Pass it
-                explicitly when calling before set_reference_path.
-            closed: The path is a lap (last point joins the first).
-            sector_scale: (s_start, s_end, scale) sectors that lower the slip
-                budget (`speed_profile.slip_budget`).
-            gg_brake, gg_floor: brake inside the combined-accel ellipse
-                (`speed_profile.gg_decel`); off by default.
-        Returns:
-            Speed per waypoint, shape (N,).
-        """
-        if path is None:
-            path = self.reference_path
-        if path is None:
-            return np.zeros(0)
-        return _speed_profile.speed_profile(
-            path, a_lat_max=a_lat_max, lock_margin=lock_margin,
-            a_accel_max=a_accel_max, a_brake_max=a_brake_max, v_max=v_max,
-            closed=closed, sector_scale=sector_scale,
-            gg_brake=gg_brake, gg_floor=gg_floor)
 
     @property
     def arc_position(self) -> Optional[float]:
@@ -442,48 +361,6 @@ class MPCController:
         if self.reference_speeds is None or len(self.reference_speeds) == 0:
             return 0.25
         return float(np.mean(self.reference_speeds)) / 8.0
-
-    def _get_reference_at_s(self, s: float, vehicle_position: np.ndarray = None) -> Tuple[np.ndarray, float]:
-        """Get reference state and speed at path position s.
-
-        Args:
-            s: Path position (arc length) - not used in this simplified version
-            vehicle_position: Current vehicle position [x, y] for finding closest point
-
-        Returns:
-            (reference_state, reference_speed)
-        """
-        if self.reference_path is None or len(self.reference_path) == 0:
-            return np.zeros(self.state_dim), 0.0
-
-        # For now, simple closest point approach to vehicle position
-        # In production, would use proper Frenet frame projection
-        if vehicle_position is not None and len(vehicle_position) >= 2:
-            # Find closest point to vehicle's current position
-            distances = np.sum((self.reference_path[:, :2] - vehicle_position[:2])**2, axis=1)
-        else:
-            # Fallback to origin if no vehicle position provided
-            distances = np.sum((self.reference_path[:, :2] - [0, 0])**2, axis=1)
-        closest_idx = np.argmin(distances)
-
-        # Get reference position
-        ref_pos = self.reference_path[closest_idx]
-
-        # Estimate heading from path direction
-        if closest_idx < len(self.reference_path) - 1:
-            path_dir = self.reference_path[closest_idx + 1] - self.reference_path[closest_idx]
-            ref_yaw = math.atan2(path_dir[1], path_dir[0])
-        else:
-            ref_yaw = 0.0
-
-        # Get reference speed
-        if self.reference_speeds is not None:
-            ref_speed = self.reference_speeds[min(closest_idx, len(self.reference_speeds)-1)]
-        else:
-            ref_speed = 3.0
-
-        # Return state [x, y, yaw, v, beta] - beta (sideslip) is 0 for reference
-        return np.array([ref_pos[0], ref_pos[1], ref_yaw, ref_speed, 0.0]), ref_speed
 
     def _nearest_path_index(self, position: np.ndarray, hint: int = None) -> int:
         """Index of the path waypoint nearest a point.
@@ -658,12 +535,6 @@ class MPCController:
                             if have_speeds else 3.0)
             ref_pos[k] = (x, y)
 
-        # Only overwrite the fallback heading if the window actually advanced;
-        # a degenerate window should not drag the carry-over with it.
-        if np.any(np.hypot(ref_pos[-1, 0] - ref_pos[0, 0],
-                           ref_pos[-1, 1] - ref_pos[0, 1]) > 1e-6):
-            self._last_heading = float(heading[-1])
-
         out[:, 0] = ref_pos[:, 0]
         out[:, 1] = ref_pos[:, 1]
         out[:, 2] = heading
@@ -711,8 +582,7 @@ class MPCController:
         Raises:
             SolveBudgetExceeded: once the wall-clock budget armed by solve() is spent
         """
-        if time.perf_counter() >= self._deadline:
-            raise SolveBudgetExceeded
+        self._check_deadline()
 
         # Predict trajectory
         states = self._predict_trajectory(initial_state, control_sequence)
@@ -878,10 +748,6 @@ class MPCController:
         current_state = self._complete_state(current_state)
         self._last_state = current_state.copy()
 
-        # Generate reference trajectory over prediction horizon
-        reference_states = []
-        reference_speeds = []
-
         # Improved approach: look ahead along the path from current vehicle position
         if self.reference_path is not None and len(self.reference_path) > 1:
             current_pos = current_state[0:2]
@@ -918,12 +784,8 @@ class MPCController:
                                 else np.full(self.prediction_horizon + 1, 3.0))
         else:
             # Zero reference if no path set
-            for k in range(self.prediction_horizon + 1):
-                reference_states.append(np.zeros(self.state_dim))
-                reference_speeds.append(0.0)
-
-            reference_states = np.array(reference_states)
-            reference_speeds = np.array(reference_speeds)
+            reference_states = np.zeros((self.prediction_horizon + 1, self.state_dim))
+            reference_speeds = np.zeros(self.prediction_horizon + 1)
 
         # A fallback continues the plan itself, so the feed-forward seed goes
         # into a copy: a blown budget must not jump the wheel to the seed.
@@ -933,9 +795,7 @@ class MPCController:
             initial_guess[0] = self._feedforward_steer(float(current_state[3]))
 
         # Bounds for optimization
-        bounds = []
-        for _ in range(self.control_horizon):
-            bounds.extend(list(zip(self.control_min, self.control_max)))
+        bounds = list(zip(self.control_min, self.control_max)) * self.control_horizon
 
         if self.fused_objective:
             self._prepare_objective(current_state, reference_states)
@@ -1053,37 +913,8 @@ class MPCController:
 
         diagnostics = {
             'solve_time_ms': solve_time * 1000,
-            'control_steering': control[0],
-            'control_acceleration': control[1],
-            'feasible': True,  # Simplified
             'fallback': self.last_fallback
         }
 
         return control, diagnostics
 
-
-def test_mpc_controller():
-    """Simple test of MPC controller."""
-    print("Testing MPC Controller...")
-
-    # Create controller
-    mpc = MPCController(prediction_horizon=5, dt=0.1)
-
-    # Set simple reference path (straight line)
-    path = np.array([[0, 0], [10, 0], [20, 0]])  # Straight line along x-axis
-    mpc.set_reference_path(path)
-
-    # Test initial state at origin, zero velocity
-    initial_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0])  # [x, y, yaw, v, beta]
-
-    # Get control command
-    control, diagnostics = mpc.get_control(initial_state)
-
-    print(f"Initial state: {initial_state}")
-    print(f"Control command: steering={control[0]:.3f}, accel={control[1]:.3f}")
-    print(f"Solve time: {diagnostics['solve_time_ms']:.1f} ms")
-    print(f"Diagnostics: {diagnostics}")
-
-
-if __name__ == "__main__":
-    test_mpc_controller()

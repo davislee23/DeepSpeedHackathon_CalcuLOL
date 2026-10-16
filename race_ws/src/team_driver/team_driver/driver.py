@@ -31,9 +31,9 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 
-from . import driver_params
-from .driver_core import DriverCore, LatchClock
-from .mpc_controller import MPCController
+import driver_params
+from driver_core import DriverCore, LatchClock
+from mpc_controller import MPCController
 
 DT_REPORT_PERIOD = 5.0   # [s] how often to log dt_measured statistics
 

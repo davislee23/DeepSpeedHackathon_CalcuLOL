@@ -45,13 +45,7 @@ from scipy import ndimage, sparse
 from scipy.interpolate import CubicSpline
 from scipy.optimize import lsq_linear, minimize
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-try:
-    from . import speed_profile as sp
-except ImportError:
-    import speed_profile as sp
+import speed_profile as sp
 
 HALF_WIDTH = 0.155            # [m] half the car's width (VehicleParameters.width / 2)
 DEFAULT_MARGIN = 0.10         # [m] extra clearance from a sealed wall
@@ -565,10 +559,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              f'driver drives a {MIN_TIME_METHOD} CSV before its runtime build')
     args = parser.parse_args(argv)
 
-    try:
-        from . import lap_floor
-    except ImportError:
-        import lap_floor
+    import lap_floor
     center_csv = args.centerline or lap_floor.default_centerline_path()
     yaml_path = find_map_yaml(center_csv)
     if yaml_path is None:

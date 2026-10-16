@@ -22,6 +22,7 @@ sys.path.insert(
         os.path.join(os.path.dirname(__file__), os.pardir, 'team_driver')))
 
 from mpc_controller import MPCController  # noqa: E402
+from speed_profile import speed_profile  # noqa: E402
 from vehicle_model import VehicleModel  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,7 +44,8 @@ def _controller(path):
     mpc = MPCController(
         vehicle_model=VehicleModel(),
         prediction_horizon=HORIZON, control_horizon=HORIZON, dt=0.025)
-    profile = mpc.speed_profile(path, v_max=3.0)
+    profile = speed_profile(path, v_max=3.0, a_lat_max=0.8, lock_margin=0.95,
+                            a_accel_max=9.51, a_brake_max=0.8)
     mpc.set_reference_path(path, profile)
     return mpc
 

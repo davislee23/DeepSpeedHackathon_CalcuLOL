@@ -36,14 +36,7 @@ import types
 
 import numpy as np
 
-_here = os.path.dirname(os.path.abspath(__file__))
-if _here not in sys.path:
-    sys.path.insert(0, _here)
-
-try:
-    from . import plant_sim                     # ROS / package import
-except ImportError:
-    import plant_sim                            # standalone
+import plant_sim
 
 # Matches the JAX kernel's PARALLEL_EPS (lidar/kernels.py:6).
 PARALLEL_EPS = 1e-12

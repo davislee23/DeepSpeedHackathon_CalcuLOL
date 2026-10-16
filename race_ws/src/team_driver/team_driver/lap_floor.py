@@ -18,13 +18,7 @@ from typing import NamedTuple, Sequence
 
 import numpy as np
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-try:
-    from . import speed_profile as sp
-except ImportError:
-    import speed_profile as sp
+import speed_profile as sp
 
 DEFAULT_A_LAT = (5.0, 7.5, 10.0, 12.5, 15.0)   # [m/s^2], about 5-15 deg of rear slip
 DEFAULT_LOCK_MARGIN = 0.95
@@ -47,13 +41,14 @@ class FloorRow(NamedTuple):
 
 def default_centerline_path() -> str:
     """The shipped centreline, found by walking up to the repo's maps/."""
-    node = _current_dir
+    here = os.path.dirname(os.path.abspath(__file__))
+    node = here
     for _ in range(MAPS_SEARCH_DEPTH):
         node = os.path.dirname(node)
         candidate = os.path.join(node, 'maps', CENTERLINE_NAME)
         if os.path.exists(candidate):
             return candidate
-    raise FileNotFoundError(f'{CENTERLINE_NAME} not found above {_current_dir}')
+    raise FileNotFoundError(f'{CENTERLINE_NAME} not found above {here}')
 
 
 def load_path(csv_path: str) -> np.ndarray:

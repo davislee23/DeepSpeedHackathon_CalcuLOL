@@ -45,14 +45,16 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import driver_params  # noqa: E402
+import lap_floor  # noqa: E402
 import plant_sim  # noqa: E402
 import scan_sim  # noqa: E402
 from driver_core import REFERENCES, DriverConfig, DriverCore  # noqa: E402
 from mpc_controller import MPCController  # noqa: E402
 from speed_profile import sector_triples  # noqa: E402
-from vehicle_model import MODEL_TYPES, VehicleModel  # noqa: E402
+from vehicle_model import MODEL_TYPES, PLANT_STEP_DT, VehicleModel  # noqa: E402
 
-PHYSICS_DT = 0.01               # s, gym_bridge.py sim_timestep
+PHYSICS_DT = PLANT_STEP_DT      # s, gym_bridge.py sim_timestep
 # Scan and odom are both 9 physics steps old when the driver reads them: the
 # depth-10 queue stays full, and its oldest entry is 9 behind the newest.
 # Measured live with a /clock probe (run 20260930T091032Z, mode 9 of 1536).
@@ -73,18 +75,11 @@ SPAWN_POSE = (-1.68, -0.01, 0.0)
 FINISH_LINE_X = 1.32
 FINISH_LINE_Y = (-0.76, 0.89)
 
-# The node's declared MPC parameters (driver_params.py; test_driver_params.py
-# holds them equal to this). DriverCore's own fallback builds horizon 10, so
-# these are what the judge runs, with or without driver_params.yaml.
-JUDGED_MPC = dict(prediction_horizon=8, control_horizon=3, dt=0.025,
-                  q_pos=2.0, q_yaw=2.0, q_vel=0.5, r_steer=0.08, r_accel=0.01,
-                  r_delta_steer=3.0, r_delta_accel=0.005,
-                  block_map=[0, 1, 1, 2, 2, 2, 2, 2], maxiter=25,
-                  solve_budget_ms=15.0,
-                  dt_schedule=[0.025, 0.025, 0.05, 0.05, 0.075, 0.075, 0.1, 0.1],
-                  feedforward=False)
-# The node's `vehicle.model` (driver_params.py; test_step3_wiring.py holds them equal).
-JUDGED_MODEL = 'ST'
+# The node's declared MPC parameters and model, read off its parameter table.
+# DriverCore's own fallback builds horizon 10, so these are what the judge
+# runs, with or without driver_params.yaml.
+JUDGED_MPC = driver_params.mpc_kwargs(driver_params.DEFAULTS)
+JUDGED_MODEL = driver_params.DEFAULTS['vehicle.model']
 # [m] Spacing of the resampled reference the lateral-error meter measures to;
 # the distance it reports is high by at most half of it.
 LATERAL_ERROR_SPACING = 0.01
@@ -400,12 +395,7 @@ def make_plant(name, seed=None):
 
 
 def _repo_root():
-    node = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(8):
-        node = os.path.dirname(node)
-        if os.path.isfile(os.path.join(node, 'maps', 'icra26.yaml')):
-            return node
-    raise FileNotFoundError('maps/icra26.yaml not found above ' + __file__)
+    return os.path.dirname(os.path.dirname(lap_floor.default_centerline_path()))
 
 
 def _feed_driver(core, scanner, state, t_sim, lr):

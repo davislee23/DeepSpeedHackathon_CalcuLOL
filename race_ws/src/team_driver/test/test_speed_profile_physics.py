@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -27,7 +28,6 @@ if _SRC not in sys.path:
 import driver_core  # noqa: E402
 import driver_params  # noqa: E402
 import lap_floor  # noqa: E402
-import mpc_controller  # noqa: E402
 import speed_profile as sp  # noqa: E402
 
 RACELINE_CSV = os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv')
@@ -325,29 +325,10 @@ class TestPlumbing(unittest.TestCase):
             with self.subTest(gg_floor=bad), self.assertRaisesRegex(ValueError, 'gg_floor'):
                 driver_params.validate({**base, 'gg_floor': bad})
 
-    def test_the_controller_forwards_both_to_the_profile(self):
-        path = _stadium()
-        mpc = mpc_controller.MPCController()
-        kw = dict(path=path, v_max=10.0, a_lat_max=12.0, a_accel_max=9.51, a_brake_max=6.0)
-        np.testing.assert_array_equal(
-            mpc.speed_profile(**kw, gg_brake=True, gg_floor=0.3),
-            sp.speed_profile(path, a_lat_max=12.0, lock_margin=0.95, a_accel_max=9.51,
-                             a_brake_max=6.0, v_max=10.0, gg_brake=True, gg_floor=0.3))
-        np.testing.assert_array_equal(mpc.speed_profile(**kw), sp.speed_profile(
-            path, a_lat_max=12.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=6.0,
-            v_max=10.0))
-
     def test_the_core_passes_its_config_to_the_profile(self):
         class Spy:
             dt = 0.025
             state_dim = 7
-
-            def __init__(self):
-                self.kwargs = None
-
-            def speed_profile(self, *, path, **kw):
-                self.kwargs = kw
-                return np.full(len(path), 3.0)
 
             def set_reference_path(self, *_a):
                 pass
@@ -357,9 +338,12 @@ class TestPlumbing(unittest.TestCase):
                           (driver_core.DriverConfig(gg_brake=True, gg_floor=0.3),
                            (True, 0.3))):
             with self.subTest(cfg=want):
-                spy = Spy()
-                driver_core.DriverCore(cfg=cfg, mpc_controller=spy)
-                self.assertEqual((spy.kwargs['gg_brake'], spy.kwargs['gg_floor']), want)
+                with mock.patch.object(driver_core, 'speed_profile',
+                                       side_effect=lambda path, **_: np.full(len(path), 3.0)
+                                       ) as profile:
+                    driver_core.DriverCore(cfg=cfg, mpc_controller=Spy())
+                kw = profile.call_args.kwargs
+                self.assertEqual((kw['gg_brake'], kw['gg_floor']), want)
 
 
 if __name__ == '__main__':

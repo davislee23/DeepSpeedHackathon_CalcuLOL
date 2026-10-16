@@ -18,48 +18,27 @@ passes whatever it likes (or nothing, for silence).
 import functools
 import math
 import os
-import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import NamedTuple, Optional
 
 import numpy as np
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-try:
-    from .mpc_controller import MPCController   # ROS / package import
-    from .vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
-    from . import raceline
-    from .speed_profile import check_gg_floor, sector_triples, slip_budget
-    from .latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
-                                  plant_servo_rate, servo_kp)
-    from .longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
-                               clearance_along_path, front_overhang, path_clearance,
-                               scan_points)
-except ImportError:
-    from mpc_controller import MPCController    # standalone `python3 lap_sim.py`
-    from vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
-    import raceline
-    from speed_profile import check_gg_floor, sector_triples, slip_budget
-    from latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
-                                 plant_servo_rate, servo_kp)
-    from longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
-                              clearance_along_path, front_overhang, path_clearance,
-                              scan_points)
+from mpc_controller import MPCController
+from vehicle_model import F1TENTH_VEHICLE_PARAMETERS, PLANT_STEP_DT, SpeedLoop, VehicleModel
+import lap_floor
+import raceline
+from speed_profile import check_gg_floor, sector_triples, slip_budget, speed_profile
+from latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
+                             plant_servo_rate, servo_kp)
+from longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
+                          clearance_along_path, front_overhang, path_clearance,
+                          scan_points)
 
 
-class _NullLogger:
-    """Swallows log calls, so the core runs with no logger attached."""
-
-    def info(self, _msg):
-        pass
-
-    def warn(self, _msg):
-        pass
-
-    def error(self, _msg):
-        pass
+# Swallows log calls, so the core runs with no logger attached.
+_NULL_LOG = SimpleNamespace(info=lambda _msg: None, warn=lambda _msg: None,
+                            error=lambda _msg: None)
 
 
 @dataclass(frozen=True)
@@ -187,7 +166,6 @@ CACHED_RACELINE = 'icra26_raceline.csv'   # config/: the fallback if the runtime
 DT_CLAMP_LOW = 0.5     # x nominal: a burst of scans must not zero the interval
 DT_CLAMP_HIGH = 3.0    # x nominal: a dropped scan must not hand over a 1 s dt
 
-PLANT_STEP_DT = 0.01            # [s] gym_bridge.py sim_timestep; one servo evaluation each
 STEER_CORRECT_MIN_SPEED = 0.8   # [m/s] below this the yaw-rate inversion is ill-conditioned
 STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % per 25 ms)
 # [s] Sim time jumping back further than this is a reset (/initialpose makes
@@ -216,8 +194,8 @@ CAP_CONTINUATION_MAX_HEADING = 0.3    # [rad] car's velocity heading to the refe
 # timer stretches it, and the next command then lands later than one period on.
 PUBLISH_INTERVAL_SMOOTHING = 0.2    # EMA weight per published command
 PUBLISH_INTERVAL_MAX = 4.0          # x mpc.dt: a stall must not predict seconds ahead
-# [rad] Largest odometry sideslip handed to the ST model (its state bound,
-# VehicleModel.get_state_bounds); beyond it the car is reversing or spinning.
+# [rad] Largest odometry sideslip handed to the ST model; beyond it the car is
+# reversing or spinning.
 MPC_BETA_LIMIT = 0.5
 
 
@@ -399,6 +377,20 @@ class LatchClock:
         return t_sim_now + solve_wall_s * rtf
 
 
+def _share_dir():
+    """The installed package's share directory, or None outside a ROS install."""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        return get_package_share_directory('team_driver')
+    except Exception:
+        return None
+
+
+def _path_length(path: np.ndarray) -> float:
+    """[m] Length of an open polyline; 0 for one point."""
+    return float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
+
+
 @functools.lru_cache(maxsize=4)
 def _built_raceline(centerline_path, margin):
     """(xy, build seconds) of the raceline for a centreline file and margin.
@@ -413,10 +405,8 @@ def _built_raceline(centerline_path, margin):
     yaml_path = raceline.find_map_yaml(centerline_path)
     if yaml_path is None:
         raise FileNotFoundError(f'no map yaml beside {centerline_path}')
-    centerline_xy = np.atleast_2d(
-        np.loadtxt(centerline_path, delimiter=',', comments='#'))[:, :2]
-    line = raceline.build_raceline(centerline_xy, raceline.load_occupancy(yaml_path),
-                                   margin=margin)
+    line = raceline.build_raceline(lap_floor.load_path(centerline_path),
+                                   raceline.load_occupancy(yaml_path), margin=margin)
     if not line.reweighted:
         raise RuntimeError('the weighted solve fell back to the uniform line, '
                            'which the tuned speed profile does not fit')
@@ -455,18 +445,7 @@ class DriverCore:
                  mpc_controller: MPCController = None,
                  logger=None):
         self.cfg = cfg if cfg is not None else DriverConfig()
-        self.log = logger if logger is not None else _NullLogger()
-
-        # Unpacked onto self so the moved code reads as it did in the node.
-        self.crawl_speed = self.cfg.crawl_speed
-        self.max_range = self.cfg.max_range
-        self.v_max = self.cfg.v_max
-        self.a_brake_max = self.cfg.a_brake_max
-        self.a_emergency = self.cfg.a_emergency
-        self.steer_limit = self.cfg.steer_limit
-        self.stop_margin = self.cfg.stop_margin
-        self.coast_steer_rate = self.cfg.coast_steer_rate
-        self.accel_limit = self.cfg.accel_limit
+        self.log = logger if logger is not None else _NULL_LOG
 
         self.mpc_controller = (mpc_controller if mpc_controller is not None
                                else MPCController(vehicle_model=VehicleModel()))
@@ -529,6 +508,7 @@ class DriverCore:
         self._emergency_binds = 0
         self._coast_count = 0
         self._coasting = False
+        self._diag_counter = -1   # the first solve logs
 
         self._load_reference_path()
 
@@ -578,41 +558,28 @@ class DriverCore:
     # ------------------------------------------------------------------
     # Reference path loading
     # ------------------------------------------------------------------
-    def _centerline_candidates(self):
-        """Places icra26_centerline.csv can legitimately live.
+    def _centerline_path(self):
+        """icra26_centerline.csv: the share directory's maps/ first, then the repo's.
 
         The package is installed under race_ws/install/... but the map ships at
         the repo root, so the obvious 'share directory' guess does not exist.
-        Try the ROS way first, then walk up from this file to the repo root.
         """
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates = []
-
+        share = _share_dir()
+        if share is not None:
+            candidate = os.path.join(share, 'maps', lap_floor.CENTERLINE_NAME)
+            if os.path.exists(candidate):
+                return candidate
         try:
-            from ament_index_python.packages import get_package_share_directory
-            candidates.append(os.path.join(
-                get_package_share_directory('team_driver'), 'maps'))
-        except Exception:
-            pass
-
-        # Walk up looking for a maps/ dir holding the file. Seven levels covers
-        # install/team_driver/lib/pythonX.Y/site-packages/team_driver/.
-        node = here
-        for _ in range(8):
-            node = os.path.dirname(node)
-            candidates.append(os.path.join(node, 'maps'))
-
-        return [os.path.join(c, 'icra26_centerline.csv') for c in candidates]
+            return lap_floor.default_centerline_path()
+        except FileNotFoundError:
+            return None
 
     def _cached_raceline_candidates(self):
         here = os.path.dirname(os.path.abspath(__file__))
         candidates = [os.path.join(os.path.dirname(here), 'config', CACHED_RACELINE)]
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            candidates.append(os.path.join(
-                get_package_share_directory('team_driver'), 'config', CACHED_RACELINE))
-        except Exception:
-            pass
+        share = _share_dir()
+        if share is not None:
+            candidates.append(os.path.join(share, 'config', CACHED_RACELINE))
         return candidates
 
     def _raceline_reference(self, centerline_path, centerline_xy):
@@ -671,26 +638,20 @@ class DriverCore:
     def _load_reference_path(self):
         """Load centerline as reference path."""
         try:
-            centerline_path = next(
-                (p for p in self._centerline_candidates() if os.path.exists(p)), None)
+            centerline_path = self._centerline_path()
 
             if centerline_path is None:
                 self.log.error(
-                    'icra26_centerline.csv not found in any of: '
-                    f'{self._centerline_candidates()}. MPC will NOT be used; '
+                    'icra26_centerline.csv not found in the share directory or '
+                    'above the package. MPC will NOT be used; '
                     'falling back to the reactive gap-following controller.')
                 self.reference_path = None
                 return
 
-            # The file is commented CSV; np.loadtxt needs comments='#' and the
-            # header lines dropped.
-            centerline_data = np.loadtxt(centerline_path, delimiter=',', comments='#')
-            centerline_data = np.atleast_2d(centerline_data)
-
+            centerline_xy = lap_floor.load_path(centerline_path)
             self.log.info(
-                f'Loaded {len(centerline_data)} centerline points from {centerline_path}')
+                f'Loaded {len(centerline_xy)} centerline points from {centerline_path}')
 
-            centerline_xy = centerline_data[:, :2]
             path = centerline_xy
             if self.cfg.reference == 'raceline':
                 path = self._raceline_reference(centerline_path, centerline_xy)
@@ -701,8 +662,8 @@ class DriverCore:
             # wide and the centerline peaks well above a curvature that 3 m/s
             # can hold, so a constant reference drives straight into the
             # outside wall at the first real corner.
-            speeds = self.mpc_controller.speed_profile(
-                path=path, v_max=self.v_max,
+            speeds = speed_profile(
+                path=path, v_max=self.cfg.v_max,
                 a_lat_max=a_lat_max, lock_margin=self.cfg.lock_margin,
                 a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max,
                 sector_scale=sectors,
@@ -745,7 +706,7 @@ class DriverCore:
         self.reference_path = path
         self.reference_speeds = speeds
         self._reference = lookup
-        self.mpc_controller.set_reference_path(path, speeds, self.a_brake_max)
+        self.mpc_controller.set_reference_path(path, speeds, self.cfg.a_brake_max)
         if not hasattr(self.mpc_controller, 'arc_position'):
             self.log.warn(f'{type(self.mpc_controller).__name__} reports no arc_position: '
                           'the profile cap is off and the emergency cap looks straight ahead')
@@ -830,6 +791,15 @@ class DriverCore:
                    if self._last_publish_t is not None else None)
         return self.latch_predictor.predict(state, t_pose, t_latch)
 
+    def _latch_or_measured(self) -> Prediction:
+        """The plant at the latch, or as measured when no latch is predicted."""
+        return self._latch if self._latch is not None else Prediction(self._measured_state(), 0.0)
+
+    def _lidar_xy(self):
+        """(x, y) of the lidar in the map, from the measured pose."""
+        return (self.position[0] + LIDAR_FORWARD * math.cos(self.yaw),
+                self.position[1] + LIDAR_FORWARD * math.sin(self.yaw))
+
     def _latch_speed(self) -> float:
         """[m/s] The speed the next command acts from; the measured one if unknown."""
         v = self._latch.speed if self._latch is not None else self.speed
@@ -889,12 +859,12 @@ class DriverCore:
 
         prev_steer = self._previous_steer()
         reach = self.steering.sv_max * dt
-        target = float(np.clip(raw_steer, -self.steer_limit, self.steer_limit))
+        target = float(np.clip(raw_steer, -self.cfg.steer_limit, self.cfg.steer_limit))
         steer = float(np.clip(target, prev_steer - reach, prev_steer + reach))
-        steer = float(np.clip(steer, -self.steer_limit, self.steer_limit))
+        steer = float(np.clip(steer, -self.cfg.steer_limit, self.cfg.steer_limit))
 
         v = self._latch_speed()
-        a = min(max(accel, -self.a_brake_max), self.accel_limit)
+        a = min(max(accel, -self.cfg.a_brake_max), self.cfg.accel_limit)
         a = min(a, (profile_speed - v) / self.mpc_dt)
         a_cap = (speed_cap - v) / self.mpc_dt
         if a_cap < a:
@@ -917,7 +887,7 @@ class DriverCore:
         happening.
         """
         prev_steer = self._previous_steer()
-        decay = self.coast_steer_rate * dt
+        decay = self.cfg.coast_steer_rate * dt
         steer = prev_steer - math.copysign(min(abs(prev_steer), decay), prev_steer)
 
         self._coast_count += 1
@@ -925,7 +895,7 @@ class DriverCore:
             self._coasting = True
             self.log.warn(f'Coasting ({why or "no usable command"}); '
                           f'{self._coast_count} coast steps so far')
-        return self._issue(steer, self._setpoint(-self.a_emergency), prev_steer, dt)
+        return self._issue(steer, self._setpoint(-self.cfg.a_emergency), prev_steer, dt)
 
     def _speed_cap(self, ranges: np.ndarray, angles: np.ndarray, bearing: float = 0.0,
                    travelled: float = 0.0) -> float:
@@ -935,7 +905,7 @@ class DriverCore:
         from the lidar, less the body's overhang ahead of it, less the distance
         covered since the scan. A braking-distance bound, so it has no steps.
         """
-        clearance = path_clearance(ranges, angles, bearing, self._half_width, self.max_range)
+        clearance = path_clearance(ranges, angles, bearing, self._half_width, self.cfg.max_range)
         return self._braking_bound(clearance - travelled - self._overhang)
 
     def _path_cap(self, ranges, angles, path) -> float:
@@ -955,26 +925,23 @@ class DriverCore:
         v = self._latch_speed()
         fallback = self._latch_travel() + v * self.mpc_dt
         path = np.asarray(path, dtype=np.float64)
-        extent = (float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
-                  if len(path) > 1 else 0.0)
+        extent = _path_length(path)
         if not (math.isfinite(self.yaw) and all(math.isfinite(c) for c in self.position)
                 and np.all(np.isfinite(path)) and extent > 1e-6):
             return self._speed_cap(ranges, angles, 0.0, fallback)
-        lidar = (self.position[0] + LIDAR_FORWARD * math.cos(self.yaw),
-                 self.position[1] + LIDAR_FORWARD * math.sin(self.yaw))
-        points = scan_points(ranges, angles, lidar, self.yaw, self.max_range)
+        points = scan_points(ranges, angles, self._lidar_xy(), self.yaw, self.cfg.max_range)
         if len(points) == 0 and np.any(ranges <= 0.0):
             return self._speed_cap(ranges, angles, 0.0, fallback)
         front = LIDAR_FORWARD + self._overhang     # base_link to the bumper
         hold = v * self.mpc_dt
-        needed = (v * v / (2.0 * self.a_emergency) + front + hold + self.stop_margin
+        needed = (v * v / (2.0 * self.cfg.a_emergency) + front + hold + self.cfg.stop_margin
                   + PATH_CAP_SLACK)
         path, hop = self._continued_plan(path, needed)
         clearance = clearance_along_path(points, path, self._half_width, needed + hop)
         if clearance > extent:      # past the plan: the hop back to the line is no travel
             clearance = max(clearance - hop, extent)
         if clearance >= needed:
-            return self.v_max       # nothing within reach of a stop: no bound
+            return self.cfg.v_max       # nothing within reach of a stop: no bound
         return self._braking_bound(clearance - front - hold)
 
     def _continued_plan(self, path: np.ndarray, length: float) -> tuple[np.ndarray, float]:
@@ -994,7 +961,7 @@ class DriverCore:
         s = self._arc_position()
         if s is None:
             return path, 0.0
-        extent = float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
+        extent = _path_length(path)
         if extent >= length:
             return path, 0.0
         offset = self._offset_from_reference(s)
@@ -1013,9 +980,7 @@ class DriverCore:
         velocity (yaw plus sideslip) within CAP_CONTINUATION_MAX_HEADING of
         the reference's direction there.
         """
-        latch = self._latch if self._latch is not None else Prediction(
-            self._measured_state(), 0.0)
-        x, y, yaw, _v, beta, _wheel, _r = latch.state
+        x, y, yaw, _v, beta, _wheel, _r = self._latch_or_measured().state
         anchor = self._reference.point_at(s)
         tangent = self._reference.point_at(s + CAP_CONTINUATION_SPACING) - anchor
         offset = np.array([x, y]) - anchor
@@ -1028,8 +993,8 @@ class DriverCore:
 
     def _braking_bound(self, reach) -> float:
         """[m/s] The speed the body stops from at `a_emergency` within `reach`."""
-        v_brake = math.sqrt(2.0 * self.a_emergency * max(reach - self.stop_margin, 0.0))
-        return float(np.clip(v_brake, self.crawl_speed, self.v_max))
+        v_brake = math.sqrt(2.0 * self.cfg.a_emergency * max(reach - self.cfg.stop_margin, 0.0))
+        return float(np.clip(v_brake, self.cfg.crawl_speed, self.cfg.v_max))
 
     def _arc_position(self) -> Optional[float]:
         """[m] The MPC's arc position for this cycle's pose, or None if it did not solve."""
@@ -1048,8 +1013,7 @@ class DriverCore:
                 or not all(math.isfinite(c) for c in self.position)):
             return 0.0
         target = self._reference.point_at(s + bearing_lookahead(self._latch_speed()))
-        lx = self.position[0] + LIDAR_FORWARD * math.cos(self.yaw)
-        ly = self.position[1] + LIDAR_FORWARD * math.sin(self.yaw)
+        lx, ly = self._lidar_xy()
         bearing = math.atan2(target[1] - ly, target[0] - lx) - self.yaw
         return (bearing + math.pi) % (2.0 * math.pi) - math.pi
 
@@ -1090,8 +1054,8 @@ class DriverCore:
         arithmetic on those propagates silently through everything downstream.
         """
         ranges = np.asarray(self._scan_ranges, dtype=np.float64)
-        ranges = np.nan_to_num(ranges, nan=0.0, posinf=self.max_range, neginf=0.0)
-        ranges = np.clip(ranges, 0.0, self.max_range)
+        ranges = np.nan_to_num(ranges, nan=0.0, posinf=self.cfg.max_range, neginf=0.0)
+        ranges = np.clip(ranges, 0.0, self.cfg.max_range)
 
         angles = self._scan_angle_min + np.arange(len(ranges)) * self._scan_angle_inc
         return ranges, angles
@@ -1107,9 +1071,7 @@ class DriverCore:
         value would bend every prediction rather than inform it.
         """
         dynamic = getattr(self.mpc_controller, 'state_dim', 6) == 7
-        latch = self._latch if self._latch is not None else Prediction(
-            self._measured_state(), 0.0)
-        x, y, yaw, v, beta, wheel, yaw_rate = latch.state
+        x, y, yaw, v, beta, wheel, yaw_rate = self._latch_or_measured().state
         state = [x, y, yaw, v, beta if dynamic else 0.0, wheel]
         if dynamic:
             state.append(yaw_rate)
@@ -1179,7 +1141,7 @@ class DriverCore:
         # 4. Reactive steering: steer at the middle of the widest gap. Used as
         #    the fallback if the MPC fails; the MPC keeps its own command memory.
         reactive_steering = float(np.clip(0.85 * target_angle,
-                                          -self.steer_limit, self.steer_limit))
+                                          -self.cfg.steer_limit, self.cfg.steer_limit))
 
         # 5. Use MPC when we have both a path and a state. Without a reference
         #    path the MPC has nothing to track and would drive the car to the
@@ -1197,14 +1159,10 @@ class DriverCore:
 
                 # /drive takes a SPEED, not an acceleration -- the simulator
                 # closes that loop itself. _condition inverts it.
-                steering = float(np.clip(mpc_control[0], -self.steer_limit, self.steer_limit))
+                steering = float(np.clip(mpc_control[0], -self.cfg.steer_limit, self.cfg.steer_limit))
                 accel = float(mpc_control[1])
 
-                if hasattr(self, '_diag_counter'):
-                    self._diag_counter += 1
-                else:
-                    self._diag_counter = 0
-
+                self._diag_counter += 1
                 if self._diag_counter % 50 == 0:  # Every ~2 s at 40 Hz
                     self.log.info(
                         f'MPC: steer={steering:.3f}, accel={accel:.2f} '
@@ -1217,7 +1175,7 @@ class DriverCore:
         else:
             # No odometry or no reference path - use reactive
             steering = reactive_steering
-            target = min(REACTIVE_SPEED, self.v_max)
+            target = min(REACTIVE_SPEED, self.cfg.v_max)
             accel = (target - self._latch_speed()) / self.mpc_dt
 
         # The caps stop the MPC talking the car past the profile or into a

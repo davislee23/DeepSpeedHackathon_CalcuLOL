@@ -318,7 +318,8 @@ class FallbackPathTest(unittest.TestCase):
                 pass
 
             def warn(self, m):
-                self.warnings.append(m)
+                if m.startswith('Coasting'):
+                    self.warnings.append(m)
 
             def error(self, _m):
                 pass

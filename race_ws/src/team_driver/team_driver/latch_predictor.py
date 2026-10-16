@@ -13,19 +13,10 @@ speed caps act from the speed it will have.
 """
 
 import math
-import os
-import sys
 from typing import List, NamedTuple, Optional, Tuple
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-try:
-    from .vehicle_model import (F1TENTH_VEHICLE_PARAMETERS, PLANT_STEP_DT, SpeedLoop,
-                                VehicleModel, VehicleParameters)
-except ImportError:
-    from vehicle_model import (F1TENTH_VEHICLE_PARAMETERS, PLANT_STEP_DT, SpeedLoop,
-                               VehicleModel, VehicleParameters)
+from vehicle_model import (F1TENTH_VEHICLE_PARAMETERS, PLANT_STEP_DT, SpeedLoop,
+                           VehicleModel, VehicleParameters)
 
 LATCH_TIME_TOL = 1e-6     # [s] stamps are float sums of 0.01; compare with slack
 # [s] Commands kept for the replay. Odometry is never this stale, and a gap

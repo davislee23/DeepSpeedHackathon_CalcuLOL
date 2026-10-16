@@ -290,7 +290,6 @@ class ClosedPathTest(unittest.TestCase):
 
     def test_lookups_it_cannot_answer_are_refused(self):
         path = longitudinal.ClosedPath(np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]))
-        self.assertFalse(path.has_values)
         with self.assertRaises(ValueError):
             path.value_at(0.5)
         with self.assertRaises(ValueError):

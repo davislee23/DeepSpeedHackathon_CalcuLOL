@@ -43,9 +43,6 @@ class ParamTableTest(unittest.TestCase):
     def test_the_model_defaults_to_the_judged_single_track(self):
         self.assertEqual(driver_params.DEFAULTS['vehicle.model'], 'ST')
 
-    def test_the_harness_runs_the_declared_model(self):
-        self.assertEqual(lap_sim.JUDGED_MODEL, driver_params.DEFAULTS['vehicle.model'])
-
     def test_the_mpc_builder_passes_the_schedule_and_feedforward(self):
         kwargs = driver_params.mpc_kwargs(_values(**{'mpc.dt_schedule': LONG,
                                                      'mpc.feedforward': True}))

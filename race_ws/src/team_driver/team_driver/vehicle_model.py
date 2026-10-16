@@ -500,53 +500,6 @@ class VehicleModel:
             return math.atan(self._st.wheelbase * kappa)
         return (self._st.wheelbase + self._st.understeer * v * v) * kappa
 
-    def get_initial_state(self, pose: Tuple[float, float, float] = None) -> np.ndarray:
-        """Get initial vehicle state.
-
-        Args:
-            pose: (x, y, yaw) in meters and radians
-
-        Returns:
-            Initial state vector
-        """
-        state = np.zeros(self.state_dim)
-        if pose is not None:
-            state[0] = pose[0]  # x
-            state[1] = pose[1]  # y
-            state[2] = pose[2]  # yaw
-            # velocity and sideslip default to zero
-        return state
-
-    def get_state_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Get state bounds for MPC constraints.
-
-        Returns:
-            (min_bounds, max_bounds) arrays
-        """
-        # Rough bounds - can be refined based on vehicle limits
-        min_bounds = np.array([
-            -float('inf'),  # x
-            -float('inf'),  # y
-            -float('inf'),  # yaw
-            self.params.v_min,  # velocity
-            -0.5,  # sideslip (rough estimate)
-            self.params.s_min,  # wheel angle, for actuated_step's sixth state
-            -float('inf'),  # yaw rate, ST's seventh
-        ])
-
-        max_bounds = np.array([
-            float('inf'),   # x
-            float('inf'),   # y
-            float('inf'),   # yaw
-            self.params.v_max,  # velocity
-            0.5,   # sideslip
-            self.params.s_max,  # wheel angle
-            float('inf'),   # yaw rate
-        ])
-
-        # One row per actuated state: the yaw rate exists only for ST.
-        return min_bounds[:self.actuated_dim], max_bounds[:self.actuated_dim]
-
     def get_control_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """Get control input bounds.
 
@@ -565,28 +518,3 @@ class VehicleModel:
 
         return min_control, max_control
 
-
-def test_vehicle_model():
-    """Simple test of vehicle model."""
-    model = VehicleModel()
-
-    # Test initial state
-    state = model.get_initial_state((0.0, 0.0, 0.0))
-    print(f"Initial state: {state}")
-
-    # Test dynamics
-    control = np.array([0.1, 1.0])  # 0.1 rad steering, 1.0 m/s^2 acceleration
-    dt = 0.025  # 40Hz
-
-    next_state = model.dynamics_discrete(state, control, dt)
-    print(f"Next state: {next_state}")
-
-    # Test bounds
-    state_min, state_max = model.get_state_bounds()
-    control_min, control_max = model.get_control_bounds()
-    print(f"State bounds: [{state_min}, {state_max}]")
-    print(f"Control bounds: [{control_min}, {control_max}]")
-
-
-if __name__ == "__main__":
-    test_vehicle_model()

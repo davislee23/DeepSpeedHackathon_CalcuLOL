@@ -97,11 +97,6 @@ class ActuatedVehicleModelTest(unittest.TestCase):
     def setUp(self):
         self.model = VehicleModel()
 
-    def test_state_bounds_have_a_steering_row_at_the_lock(self):
-        lo, hi = self.model.get_state_bounds()
-        self.assertEqual(len(lo), 6)
-        self.assertEqual((lo[5], hi[5]), (PARAMS.s_min, PARAMS.s_max))
-
     def test_the_car_turns_with_the_wheel_not_with_the_command(self):
         state = np.array([0.0, 0.0, 0.0, 2.0, 0.0, 0.0])
         nxt = self.model.actuated_step(state, np.array([0.4, 0.0]), DT)

@@ -11,19 +11,11 @@ turns away from it.
 """
 
 import math
-import os
-import sys
 from typing import Optional
 
 import numpy as np
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-try:
-    from .vehicle_model import VehicleParameters   # ROS / package import
-except ImportError:
-    from vehicle_model import VehicleParameters    # standalone / tests
+from vehicle_model import VehicleParameters
 
 # [m] base_link -> laser, gym_bridge's `lidar_base_link_to_lidar_tf` default.
 LIDAR_FORWARD = 0.275
@@ -157,10 +149,6 @@ class ClosedPath:
         self._y = closed[:, 1]
         # One per point plus the first again, for the closing segment.
         self._values = None if v is None else np.append(v, v[0])
-
-    @property
-    def has_values(self) -> bool:
-        return self._values is not None
 
     def _wrap(self, s: float) -> float:
         if not math.isfinite(s):

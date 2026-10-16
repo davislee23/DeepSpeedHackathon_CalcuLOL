@@ -17,24 +17,14 @@ exposing them would only let the model drift from the plant it predicts.
 """
 
 import math
-import os
-import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from types import MappingProxyType
 from typing import Any
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-try:
-    from .driver_core import DriverConfig, REFERENCES   # ROS / package import
-    from .speed_profile import check_gg_floor, sector_triples
-    from .vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
-except ImportError:
-    from driver_core import DriverConfig, REFERENCES    # standalone / tests
-    from speed_profile import check_gg_floor, sector_triples
-    from vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
+from driver_core import DriverConfig, REFERENCES
+from speed_profile import check_gg_floor, sector_triples
+from vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 
 PARAMS_SOURCE_DEFAULT = 'CODE_DEFAULTS'
 CONTROL_PERIOD_TOLERANCE = 1e-9   # [s] the same physical quantity, set in two places
@@ -57,7 +47,7 @@ _SERVO = ServoModel()
 
 # The node's own parameters, then every DriverConfig field (read off the
 # dataclass, so one cannot be added there and forgotten here), then the MPC and
-# the servo model. `mpc.*` mirrors lap_sim.JUDGED_MPC; a test holds them equal.
+# the servo model. lap_sim.JUDGED_MPC is read off `mpc.*`.
 PARAM_SPECS: tuple[ParamSpec, ...] = (
     ParamSpec('params_source', PARAMS_SOURCE_DEFAULT),
     ParamSpec('scan_topic', '/scan'),

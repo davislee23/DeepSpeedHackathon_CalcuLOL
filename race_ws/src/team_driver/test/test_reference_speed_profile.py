@@ -27,6 +27,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, os.path.abspath(_SRC))
 
 from mpc_controller import MPCController  # noqa: E402
+from speed_profile import closed_curvature, speed_profile  # noqa: E402
 from vehicle_model import VehicleModel  # noqa: E402
 
 SPAWN_WAYPOINT = 377   # where the referee spawns the car on icra26
@@ -45,7 +46,8 @@ def _controller(path):
     mpc = MPCController(vehicle_model=VehicleModel(),
                        prediction_horizon=HORIZON, control_horizon=HORIZON,
                        dt=0.025)
-    profile = mpc.speed_profile(path, v_max=3.0)
+    profile = speed_profile(path, v_max=3.0, a_lat_max=0.8, lock_margin=0.95,
+                            a_accel_max=9.51, a_brake_max=0.8)
     mpc.set_reference_path(path, profile)
     return mpc
 
@@ -126,7 +128,7 @@ class TestWindowSpeedVariesAlongTrack(unittest.TestCase):
 
     def test_slow_corner_reads_slower_than_straight(self):
         """The tightest corner must ask for less speed than the fastest straight."""
-        kappa = self.mpc._kappa_smooth
+        kappa = closed_curvature(self.mpc.reference_path)
         speeds = self.mpc.reference_speeds
         tight = int(np.argmax(kappa))
         fast = int(np.argmin(kappa))

@@ -75,12 +75,6 @@ class DeclarationTableTests(unittest.TestCase):
                 # Through driver_config(): a tuple field is declared as a ROS list.
                 self.assertEqual(getattr(declared, field.name), getattr(cfg, field.name))
 
-    def test_mpc_defaults_are_what_the_harness_calls_the_judged_config(self):
-        # lap_sim.JUDGED_MPC is "what the judge runs"; the node must agree.
-        for key, expected in lap_sim.JUDGED_MPC.items():
-            with self.subTest(key=key):
-                self.assertEqual(driver_params.DEFAULTS[f'mpc.{key}'], expected)
-
     def test_servo_defaults_are_the_calibrated_model(self):
         servo = vehicle_model.ServoModel()
         self.assertEqual(driver_params.DEFAULTS['servo.alpha'], servo.alpha)

@@ -25,20 +25,12 @@ Every plant constant comes from `VehicleParameters`; none is a tunable.
 """
 
 import math
-import os
-import sys
 from collections.abc import Sequence
 from typing import Optional
 
 import numpy as np
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-try:
-    from .vehicle_model import F1TENTH_VEHICLE_PARAMETERS as _VP
-except ImportError:
-    from vehicle_model import F1TENTH_VEHICLE_PARAMETERS as _VP
+from vehicle_model import F1TENTH_VEHICLE_PARAMETERS as _VP
 
 GRAVITY = 9.81                    # [m/s^2] single_track.py's g
 MIN_CORNER_SPEED = 0.5            # [m/s] the plant's kinematic switch; a floor, not a target
